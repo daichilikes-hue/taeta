@@ -24,11 +24,14 @@ local Linger = 3; --// extra seconds stuff stays alive so particles/trails dont 
 --// the farther you are from it, the less it hits your screen
 local NearDistance, FarDistance = 120, 420
 
+--// Rig
+local GhostTransparency = 0.5; --// how see-through the rig is during Fly In (back to normal on the flash)
+
 --// Main VFX model
 local MainStartDrop = 250; --// studs under the rig while its VFX warm up
 local MainEndDrop = 10; --// studs under the rig after the reveal
 
---// Screen look while Fly In lands
+--// Screen look
 local WindFov = 10; --// degrees the view tightens during Fly In
 local MainFov = 12; --// degrees the view opens up during Main
 local BuildFov = 4; --// Main slowly tightens back to this right before the reveal
@@ -46,14 +49,24 @@ local BeatDrain = 0.45; --// colour drained on a beat
 local BeatContrast = 0.3
 local BeatVignette = 0.5; --// how far the vignette slams in on a beat
 
---// WhiteTrail orbit around the character
-local TrailCount = 3
-local OrbitRadius = 7
-local OrbitStartRadius = 14; --// they start wide and close in during Fly In
+--// Orbiting trails. Three stages, each its own part in the folder:
+--//   StartTrail  during Fly In, gone on the flash
+--//   WhiteTrail  from the flash (when Main starts)
+--//   Trail       TrailDelay seconds after Main starts
+local StartTrailCount, StartTrailRadius = 3, 7
+local WhiteTrailCount, WhiteTrailRadius = 2, 21
+local TrailCount, TrailRadius = 3, 7
+local TrailDelay = 5
+
 local OrbitSpeed = 0.9; --// radians per second, about 7 seconds a lap
 local OrbitHeight = 1; --// above the middle of the character
 local OrbitBob = 1.2; --// gentle up and down drift
 local OrbitTiltMin, OrbitTiltMax = 12, 32; --// degrees each orbit ring is tipped
+local OrbitMaxDip = 6; --// big rings get tipped less so they never dip more than this far down
+
+--// Time stop (TimeStopAtmosphere + lightning, from the folder)
+local TimeStopFade = 0.35; --// how fast the time stop look comes in on the reveal
+local StrikeGapMin, StrikeGapMax = 0.5, 1.3; --// seconds between lightning strikes during the hold
 
 --// ==============================
 --//
@@ -80,6 +93,20 @@ local function findModel(root, name)
 	for _, descendant in ipairs(root:GetDescendants()) do
 		if descendant:IsA("Model") and descendant.Name == name then
 			return descendant
+		end
+	end
+	return nil
+end
+
+--// exact name first, then any child whose name contains the word (any capitalisation)
+local function findLoose(root, exact, word)
+	local found = root:FindFirstChild(exact)
+	if found then
+		return found
+	end
+	for _, child in ipairs(root:GetChildren()) do
+		if string.find(string.lower(child.Name), word, 1, true) then
+			return child
 		end
 	end
 	return nil
@@ -131,7 +158,7 @@ end
 local function place(object, cf)
 	if object:IsA("BasePart") then
 		object.CFrame = cf
-	else
+	elseif object:IsA("PVInstance") then
 		object:PivotTo(cf)
 	end
 end
@@ -184,6 +211,16 @@ local function nearness(position)
 	return 1 - (Distance - NearDistance) / (FarDistance - NearDistance)
 end
 
+--// what each post effect looks like when it's doing nothing (so time stop ones can fade in from it)
+local NeutralEffect = {
+	ColorCorrectionEffect = { Brightness = 0, Contrast = 0, Saturation = 0, TintColor = Color3.new(1, 1, 1) },
+	BloomEffect = { Intensity = 0 },
+	BlurEffect = { Size = 0 },
+	SunRaysEffect = { Intensity = 0 },
+	DepthOfFieldEffect = { FarIntensity = 0, NearIntensity = 0 },
+}
+local AtmosphereProps = { "Density", "Offset", "Color", "Decay", "Glare", "Haze" }
+
 --// ==============================
 --//
 --//  THE STOMP
@@ -215,7 +252,26 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 	local Rig = RigTemplate:Clone()
 	place(Rig, SpawnCFrame)
+
+	--// ghost the rig for Fly In: parts, meshparts and decals go see-through, remembered so the flash can bring them back
+	local RigSaved = {}
+	local RigLook = Rig:GetDescendants()
+	table.insert(RigLook, Rig)
+	for _, v in ipairs(RigLook) do
+		if (v:IsA("BasePart") or v:IsA("Decal")) and v.Transparency < 1 then
+			RigSaved[v] = v.Transparency
+			v.Transparency = math.max(v.Transparency, GhostTransparency)
+		end
+	end
 	Rig.Parent = workspace
+
+	local function solidRig()
+		for v, transparency in pairs(RigSaved) do
+			if v.Parent then
+				v.Transparency = transparency
+			end
+		end
+	end
 
 	local Animator
 	local AnimatorParent = Rig:FindFirstChildOfClass("Humanoid") or Rig:FindFirstChildOfClass("AnimationController")
@@ -423,18 +479,22 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		end)
 	end
 
-	--// a big beat, then smaller echoes
-	local function toll(strength)
+	--// a big beat, then smaller echoes (onBeat runs with each one, e.g. a lightning strike)
+	local function toll(strength, onBeat)
 		for index = 1, Beats do
 			later((index - 1) * BeatGap, function()
-				beat(strength * BeatFade ^ (index - 1))
+				local power = strength * BeatFade ^ (index - 1)
+				beat(power)
+				if onBeat then
+					onBeat(power)
+				end
 			end)
 		end
 	end
 
 	--// ==============================
 	--//
-	--//  WHITE TRAILS (slow orbit around the character)
+	--//  ORBITING TRAILS (StartTrail -> WhiteTrail -> Trail)
 	--//
 	--// ==============================
 
@@ -451,43 +511,16 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		return SpawnCFrame.Position
 	end
 
-	local OrbitRadiusValue = Instance.new("NumberValue")
-	OrbitRadiusValue.Value = OrbitStartRadius
-	local OrbitSpeedValue = Instance.new("NumberValue")
-	OrbitSpeedValue.Value = 1
+	--// these scale every group at once (the build pulls them all in, the reveal throws them all out)
+	local OrbitRadiusScale = Instance.new("NumberValue")
+	OrbitRadiusScale.Value = 1
+	local OrbitSpeedScale = Instance.new("NumberValue")
+	OrbitSpeedScale.Value = 1
 
-	local Orbiters = {}
+	local OrbitGroups = {}
 	local OrbitClock = 0
 	local SmoothCenter = nil
 	local OrbitConnection = nil
-
-	local WhiteTrailTemplate = Folder:FindFirstChild("WhiteTrail")
-	if WhiteTrailTemplate and (WhiteTrailTemplate:IsA("BasePart") or WhiteTrailTemplate:IsA("Model")) then
-		for i = 1, TrailCount do
-			local Object = WhiteTrailTemplate:Clone()
-			local Fade = {}
-			for _, p in ipairs(partsOf(Object)) do
-				noPhysics(p)
-				Fade[p] = p.Transparency
-				p.Transparency = 1
-			end
-			setEmitters(Object, false)
-
-			local Step = (i - 1) / math.max(TrailCount - 1, 1)
-			table.insert(Orbiters, {
-				Object = Object,
-				Fade = Fade,
-				Angle = (i - 1) * (2 * math.pi / TrailCount),
-				--// alternate the tip so the rings cross each other instead of stacking
-				Tilt = math.rad(OrbitTiltMin + (OrbitTiltMax - OrbitTiltMin) * Step) * (i % 2 == 0 and -1 or 1),
-				Yaw = (i - 1) * (2 * math.pi / TrailCount) * 0.5,
-				Phase = i * 1.7,
-				SpeedScale = 0.85 + 0.3 * Step, --// slightly different speeds so they drift past each other
-			})
-		end
-	elseif not WhiteTrailTemplate then
-		warn("StompModule: no 'WhiteTrail' found in the folder, skipping the orbit")
-	end
 
 	local function orbitCFrame(orbiter, center, radius)
 		local a = orbiter.Angle
@@ -499,39 +532,91 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		return CFrame.lookAt(Position, Position + Tangent) --// faces where its going so the trail stays wide
 	end
 
-	local function spawnOrbiters(fadeTime)
-		if #Orbiters == 0 then
+	local function startOrbitLoop()
+		if OrbitConnection then
 			return
 		end
 		SmoothCenter = getCenter()
-		for _, o in ipairs(Orbiters) do
-			--// placed before parenting/enabling so the trail doesnt streak in from the template's spot
-			place(o.Object, orbitCFrame(o, SmoothCenter, OrbitRadiusValue.Value))
-			o.Object.Parent = workspace
-			setEmitters(o.Object, true)
-			for p, transparency in pairs(o.Fade) do
-				TweenService:Create(p, TweenInfo.new(fadeTime), { Transparency = transparency }):Play()
-			end
-		end
-
 		OrbitConnection = RunService.RenderStepped:Connect(function(dt)
 			OrbitClock += dt
 			--// smoothed so the orbit glides with the character instead of snapping with every animation pose
 			SmoothCenter = SmoothCenter:Lerp(getCenter(), 1 - math.exp(-dt * 6))
-			local Radius = OrbitRadiusValue.Value
-			local Speed = OrbitSpeed * OrbitSpeedValue.Value
-			for _, o in ipairs(Orbiters) do
-				if o.Object.Parent then
-					o.Angle += dt * Speed * o.SpeedScale
-					place(o.Object, orbitCFrame(o, SmoothCenter, Radius))
+			local Speed = OrbitSpeed * OrbitSpeedScale.Value
+			for _, group in ipairs(OrbitGroups) do
+				local Radius = group.Radius.Value * OrbitRadiusScale.Value
+				for _, o in ipairs(group.Orbiters) do
+					if o.Object.Parent then
+						o.Angle += dt * Speed * o.SpeedScale
+						place(o.Object, orbitCFrame(o, SmoothCenter, Radius))
+					end
 				end
 			end
 		end)
 	end
 
-	local function releaseOrbiters(time)
+	--// spawns count copies of the named part circling the character; they grow from startRadius to radius over introTime
+	local function spawnOrbitGroup(name, count, radius, startRadius, introTime, fadeTime)
+		local Template = Folder:FindFirstChild(name)
+		if not (Template and (Template:IsA("BasePart") or Template:IsA("Model"))) then
+			warn("StompModule: no '" .. name .. "' part found in the folder, skipping it")
+			return nil
+		end
+
+		startOrbitLoop()
+
+		local Group = { Name = name, Orbiters = {}, Radius = Instance.new("NumberValue"), Released = false }
+		Group.Radius.Value = startRadius
+
+		--// tip big rings less so they don't dig into the floor
+		local MaxTilt = math.deg(math.asin(math.min(1, OrbitMaxDip / math.max(radius, 0.01))))
+		local TiltMin, TiltMax = math.min(OrbitTiltMin, MaxTilt), math.min(OrbitTiltMax, MaxTilt)
+		local Start = math.random() * math.pi * 2 --// each group starts somewhere different
+
+		for i = 1, count do
+			local Object = Template:Clone()
+			local Fade = {}
+			for _, p in ipairs(partsOf(Object)) do
+				noPhysics(p)
+				Fade[p] = p.Transparency
+				p.Transparency = 1
+			end
+			setEmitters(Object, false)
+
+			local Step = (i - 1) / math.max(count - 1, 1)
+			local Orbiter = {
+				Object = Object,
+				Fade = Fade,
+				Angle = Start + (i - 1) * (2 * math.pi / count),
+				--// alternate the tip so the rings cross each other instead of stacking
+				Tilt = math.rad(TiltMin + (TiltMax - TiltMin) * Step) * (i % 2 == 0 and -1 or 1),
+				Yaw = Start + (i - 1) * (math.pi / count),
+				Phase = i * 1.7,
+				SpeedScale = 0.85 + 0.3 * Step, --// slightly different speeds so they drift past each other
+			}
+			table.insert(Group.Orbiters, Orbiter)
+
+			--// placed before parenting/enabling so the trail doesnt streak in from the template's spot
+			place(Object, orbitCFrame(Orbiter, SmoothCenter, startRadius * OrbitRadiusScale.Value))
+			Object.Parent = workspace
+			setEmitters(Object, true)
+			for p, transparency in pairs(Fade) do
+				TweenService:Create(p, TweenInfo.new(fadeTime), { Transparency = transparency }):Play()
+			end
+		end
+
+		TweenService:Create(Group.Radius, TweenInfo.new(introTime, Quint, Out), { Value = radius }):Play()
+		table.insert(OrbitGroups, Group)
+		return Group
+	end
+
+	--// stops a group emitting and fades it; it keeps circling while its trails die off, then goes
+	local function releaseOrbitGroup(group, time)
+		if not group or group.Released then
+			return
+		end
+		group.Released = true
 		local Life = 0
-		for _, o in ipairs(Orbiters) do
+		for _, o in ipairs(group.Orbiters) do
 			setEmitters(o.Object, false) --// existing trail segments still fade out naturally
 			Life = math.max(Life, longestLife(o.Object))
 			for p in pairs(o.Fade) do
@@ -540,18 +625,176 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 				end
 			end
 		end
-		--// keep them circling while they fade, then clean up
 		task.delay(time + math.min(Life, 5) + 0.2, function()
-			if OrbitConnection then
-				OrbitConnection:Disconnect()
-				OrbitConnection = nil
-			end
-			for _, o in ipairs(Orbiters) do
+			for _, o in ipairs(group.Orbiters) do
 				o.Object:Destroy()
 			end
-			OrbitRadiusValue:Destroy()
-			OrbitSpeedValue:Destroy()
+			group.Radius:Destroy()
+			local index = table.find(OrbitGroups, group)
+			if index then
+				table.remove(OrbitGroups, index)
+			end
 		end)
+	end
+
+	--// ==============================
+	--//
+	--//  TIME STOP (TimeStopAtmosphere + lightning)
+	--//
+	--// ==============================
+
+	local TimeStopTemplate = findLoose(Folder, "TimeStopAtmosphere", "atmosphere")
+	local LightningTemplate = findLoose(Folder, "TimeStopLightning", "lightning")
+	local TimeStopUndo = {} --// each entry eases one piece of the time stop look back out
+
+	--// the time stop can be an Atmosphere, a post effect, a Sky, or a folder of any of those
+	local function applyTimeStopPiece(source, time)
+		if source:IsA("Atmosphere") then
+			local Existing = Lighting:FindFirstChildOfClass("Atmosphere")
+			if Existing then
+				--// blend the map's own atmosphere into the time stop one, and back after
+				local Saved, Goal = {}, {}
+				for _, key in ipairs(AtmosphereProps) do
+					Saved[key] = Existing[key]
+					Goal[key] = source[key]
+				end
+				TweenService:Create(Existing, TweenInfo.new(time), Goal):Play()
+				table.insert(TimeStopUndo, function(t)
+					if Existing.Parent then
+						TweenService:Create(Existing, TweenInfo.new(t), Saved):Play()
+					end
+				end)
+			else
+				local Clone = source:Clone()
+				local Goal = { Density = Clone.Density, Haze = Clone.Haze, Glare = Clone.Glare }
+				Clone.Density, Clone.Haze, Clone.Glare = 0, 0, 0
+				Clone.Parent = Lighting
+				TweenService:Create(Clone, TweenInfo.new(time), Goal):Play()
+				table.insert(TimeStopUndo, function(t)
+					TweenService:Create(Clone, TweenInfo.new(t), { Density = 0, Haze = 0, Glare = 0 }):Play()
+					task.delay(t + 0.05, Clone.Destroy, Clone)
+				end)
+			end
+		elseif NeutralEffect[source.ClassName] then
+			local Neutral = NeutralEffect[source.ClassName]
+			local Clone = source:Clone()
+			local Goal = {}
+			for key, value in pairs(Neutral) do
+				Goal[key] = Clone[key]
+				Clone[key] = value
+			end
+			Clone.Enabled = true
+			Clone.Parent = Lighting
+			TweenService:Create(Clone, TweenInfo.new(time), Goal):Play()
+			table.insert(TimeStopUndo, function(t)
+				TweenService:Create(Clone, TweenInfo.new(t), Neutral):Play()
+				task.delay(t + 0.05, Clone.Destroy, Clone)
+			end)
+		elseif source:IsA("Sky") then
+			--// skies can't blend, so this swaps under the reveal flash
+			local OldSkies = {}
+			for _, v in ipairs(Lighting:GetChildren()) do
+				if v:IsA("Sky") then
+					table.insert(OldSkies, v)
+					v.Parent = nil
+				end
+			end
+			local Clone = source:Clone()
+			Clone.Parent = Lighting
+			table.insert(TimeStopUndo, function()
+				Clone:Destroy()
+				for _, v in ipairs(OldSkies) do
+					v.Parent = Lighting
+				end
+			end)
+		else
+			for _, child in ipairs(source:GetChildren()) do
+				applyTimeStopPiece(child, time)
+			end
+		end
+	end
+
+	local function undoTimeStop(time)
+		for _, undo in ipairs(TimeStopUndo) do
+			pcall(undo, time)
+		end
+		table.clear(TimeStopUndo)
+	end
+
+	local Lightning
+	local LightningBursts = {} --// emitters/beams that only fire on a strike
+	local LightningLights = {}
+	local LightningSounds = {} --// the template's sounds; strikes play copies of these
+
+	local function spawnLightning()
+		if not LightningTemplate then
+			return
+		end
+		Lightning = LightningTemplate:Clone()
+		for _, p in ipairs(partsOf(Lightning)) do
+			noPhysics(p)
+		end
+		if Lightning:IsA("PVInstance") then
+			place(Lightning, CFrame.new(SpawnCFrame.Position) * Lightning:GetPivot().Rotation)
+		end
+
+		--// anything already on in the template keeps running; everything else (and anything with an
+		--// EmitCount attribute) only fires on strikes
+		for _, v in ipairs(Lightning:GetDescendants()) do
+			if v:IsA("ParticleEmitter") or v:IsA("Beam") then
+				if not v.Enabled or v:GetAttribute("EmitCount") then
+					v.Enabled = false
+					table.insert(LightningBursts, v)
+				end
+			elseif v:IsA("Light") then
+				LightningLights[v] = v.Brightness
+			elseif v:IsA("Sound") then
+				table.insert(LightningSounds, v)
+			end
+		end
+		Lightning.Parent = workspace
+	end
+
+	--// one crack of lightning: bursts the emitters, flickers the beams, pops the lights, a small flash and jolt
+	local function strike(power)
+		if not Lightning or not Lightning.Parent then
+			return
+		end
+		for _, v in ipairs(LightningBursts) do
+			if v:IsA("ParticleEmitter") then
+				local Count = v:GetAttribute("EmitCount") or 12
+				task.delay(v:GetAttribute("EmitDelay") or 0, function()
+					if v.Parent then
+						v:Emit(math.max(1, math.floor(Count * power + 0.5)))
+					end
+				end)
+			else
+				v.Enabled = true
+				task.delay(0.06 + math.random() * 0.1, function()
+					if v.Parent then
+						v.Enabled = false
+					end
+				end)
+			end
+		end
+		for light, brightness in pairs(LightningLights) do
+			if light.Parent then
+				light.Brightness = brightness * (1 + 2 * power)
+				TweenService:Create(light, TweenInfo.new(0.25), { Brightness = brightness }):Play()
+			end
+		end
+		for _, v in ipairs(LightningSounds) do
+			if v.Parent then
+				local Sound = v:Clone()
+				Sound.Volume = v.Volume * math.clamp(power, 0.2, 1)
+				Sound.PlaybackSpeed = v.PlaybackSpeed * (0.9 + math.random() * 0.2)
+				Sound.Parent = v.Parent
+				Sound:Play()
+				task.delay(math.max(Sound.TimeLength, 1) + 0.5, Sound.Destroy, Sound)
+			end
+		end
+		flash(0.25 * power * Intensity * Feel, 0.15)
+		shake(1.5 * power, 14, 0, 0.25)
 	end
 
 	--// ==============================
@@ -593,13 +836,14 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 	--//
 	--// ==============================
 
+	local Rumble = nil --// sustained shake during the hold
 	local Finished = false
 	local function finish(quick)
 		if Finished then
 			return
 		end
 		Finished = true
-		Alive = false --// stops any beats still queued up
+		Alive = false --// stops any beats/strikes still queued up
 
 		local Time = quick and 0.2 or OutroTime
 
@@ -608,17 +852,21 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 			flash(0.6 * Intensity * Feel, 0.5)
 		end
 		restoreMap()
+		undoTimeStop(Time)
 
 		--// screen eases back to exactly how it was
-		Rest.Fov, Rest.Vignette = 0, 1
-		Rest.Grade = { Brightness = 0, Contrast = 0, Saturation = 0 }
 		tweenOne("Fov", Camera, Time, { FieldOfView = OriginalFov }, Sine, InOut)
 		tweenOne("Grade", Grade, Time, { Brightness = 0, Contrast = 0, Saturation = 0 })
 		tweenOne("Vignette", Vignette, Time, { ImageTransparency = 1 })
 		tweenOne("Blur", Blur, Time, { Size = 0 })
 		tweenOne("Bloom", Bloom, Time, { Intensity = 0, Size = 24 })
+		if Rumble then
+			pcall(Rumble.StartFadeOut, Rumble, Time)
+		end
 
-		releaseOrbiters(Time)
+		for _, group in ipairs(table.clone(OrbitGroups)) do
+			releaseOrbitGroup(group, Time)
+		end
 
 		pcall(function()
 			FlyInTrack:Stop(0)
@@ -634,14 +882,16 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 			end
 		end
 
-		--// Main VFX stops emitting and its lights die down, then it goes once the particles are done
-		local MainLife = 0
-		if MainModel and MainModel.Parent then
-			setEmitters(MainModel, false)
-			MainLife = math.min(longestLife(MainModel), 6)
-			for _, v in ipairs(MainModel:GetDescendants()) do
-				if v:IsA("Light") then
-					TweenService:Create(v, TweenInfo.new(Time), { Brightness = 0 }):Play()
+		--// Main VFX and lightning stop emitting and their lights die down, then they go once the particles are done
+		local EffectLife = 0
+		for _, Effect in ipairs({ MainModel, Lightning }) do
+			if Effect and Effect.Parent then
+				setEmitters(Effect, false)
+				EffectLife = math.max(EffectLife, math.min(longestLife(Effect), 6))
+				for _, v in ipairs(Effect:GetDescendants()) do
+					if v:IsA("Light") then
+						TweenService:Create(v, TweenInfo.new(Time), { Brightness = 0 }):Play()
+					end
 				end
 			end
 		end
@@ -661,10 +911,23 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 			Rig:Destroy()
 		end)
 
-		task.delay(Time + MainLife + 0.5, function()
+		task.delay(Time + EffectLife + 0.5, function()
 			if MainModel then
 				MainModel:Destroy()
 			end
+			if Lightning then
+				Lightning:Destroy()
+			end
+		end)
+
+		--// orbit loop outlives the trail groups (they clean themselves up within Time + 5.2s)
+		task.delay(Time + 5.5, function()
+			if OrbitConnection then
+				OrbitConnection:Disconnect()
+				OrbitConnection = nil
+			end
+			OrbitRadiusScale:Destroy()
+			OrbitSpeedScale:Destroy()
 		end)
 
 		--// let the last shakes die out before unbinding the shaker
@@ -690,15 +953,14 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 	local function run()
 		--// ==============================
 		--//  STAGE 1: FLY IN
-		--//  view tightens, vignette creeps in, colour drains a bit, trails close in around the rig
+		--//  ghost rig, StartTrails close in, view tightens, vignette creeps in, colour drains a bit
 		--// ==============================
 
 		FlyInTrack:Play()
 		local FlyInLength = FlyInTrack.Length > 0 and FlyInTrack.Length or 1
 		local WindTime = math.max(FlyInLength, 0.7)
 
-		spawnOrbiters(math.min(WindTime, 0.8))
-		tweenOne("OrbitRadius", OrbitRadiusValue, WindTime, { Value = OrbitRadius }, Quad, Out)
+		local StartTrails = spawnOrbitGroup("StartTrail", StartTrailCount, StartTrailRadius, StartTrailRadius * 2, WindTime, math.min(WindTime, 0.8))
 
 		Rest.Fov = -WindFov
 		Rest.Vignette = 0.45
@@ -716,11 +978,14 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		end
 
 		--// ==============================
-		--//  STAGE 2: LANDING -> MAIN
-		--//  flash, one beat, and the view opens up into the Main look
+		--//  STAGE 2: TRANSFORMED -> MAIN
+		--//  flash, rig goes solid, StartTrails out, WhiteTrails burst out wide, the view opens into the Main look
 		--// ==============================
 
 		flash(Intensity * Feel)
+		solidRig()
+		releaseOrbitGroup(StartTrails, 0.25)
+		spawnOrbitGroup("WhiteTrail", WhiteTrailCount, WhiteTrailRadius, WhiteTrailRadius * 0.4, 1.1, 0.25)
 		MainTrack:Play()
 
 		Rest.Fov = MainFov
@@ -734,9 +999,14 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		bloom(1.2, 44, 0.6)
 
 		--// trails get a little nudge from the landing, then settle back to their slow pace
-		tweenOne("OrbitSpeed", OrbitSpeedValue, 0.2, { Value = 1.6 }, Quad, Out)
+		tweenOne("OrbitSpeed", OrbitSpeedScale, 0.2, { Value = 1.6 }, Quad, Out)
 		later(0.2, function()
-			tweenOne("OrbitSpeed", OrbitSpeedValue, 1.5, { Value = 1 }, Sine, Out)
+			tweenOne("OrbitSpeed", OrbitSpeedScale, 1.5, { Value = 1 }, Sine, Out)
+		end)
+
+		--// the inner Trails come in a few seconds into Main, spiralling out from the body
+		later(TrailDelay, function()
+			spawnOrbitGroup("Trail", TrailCount, TrailRadius, 1, 1.2, 0.4)
 		end)
 
 		if not hold(0.8) then
@@ -757,7 +1027,7 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		grade(Rest.Grade, BuildTime, Sine, In)
 		bloom(1.6, 52, BuildTime, Sine, In)
 		shake(1.6, 3, BuildTime, 0.4) --// rumble swells right up to the hit
-		tweenOne("OrbitRadius", OrbitRadiusValue, BuildTime, { Value = OrbitRadius * 0.7 }, Sine, In)
+		tweenOne("OrbitRadius", OrbitRadiusScale, BuildTime, { Value = 0.75 }, Sine, In)
 
 		if not hold(BuildTime) then
 			return
@@ -765,14 +1035,18 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 		--// ==============================
 		--//
-		--//  STAGE 4: THE REVEAL (the main part of the stomp)
+		--//  STAGE 4: THE REVEAL / TIME STOP (the main part of the stomp)
 		--//
 		--// ==============================
 
 		if Feel > 0 then
 			hideMap()
+			if TimeStopTemplate then
+				applyTimeStopPiece(TimeStopTemplate, TimeStopFade)
+			end
 		end
 		flash(1.2 * Intensity * Feel, 0.5)
+		spawnLightning()
 
 		--// raise the Main VFX from under the ground to just under the rig
 		if MainModel and MainModel.Parent then
@@ -793,11 +1067,11 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 			RiseTween:Play()
 		end
 
-		--// the toll: a big in-and-out, then two smaller echoes
+		--// the toll: a big in-and-out, then two smaller echoes, lightning cracking on each
 		Rest.Fov = MainFov
 		Rest.Vignette = 0.12
 		Rest.Grade = MainLook
-		toll(1)
+		toll(1, strike)
 		shake(2.5, 6, 0.1, 2.5) --// long tail under the beats
 
 		--// bloom spike
@@ -806,21 +1080,37 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 			bloom(1.2, 44, 1.4)
 		end)
 
-		--// trails get thrown wide by the blast, then drift back in at their slow pace
-		tweenOne("OrbitRadius", OrbitRadiusValue, 0.5, { Value = OrbitRadius * 1.6 }, Quint, Out)
-		tweenOne("OrbitSpeed", OrbitSpeedValue, 0.25, { Value = 1.8 }, Quad, Out)
+		--// every trail gets thrown wide by the blast, then drifts back in at its slow pace
+		tweenOne("OrbitRadius", OrbitRadiusScale, 0.5, { Value = 1.35 }, Quint, Out)
+		tweenOne("OrbitSpeed", OrbitSpeedScale, 0.25, { Value = 1.8 }, Quad, Out)
 		later(0.6, function()
-			tweenOne("OrbitRadius", OrbitRadiusValue, 2.2, { Value = OrbitRadius * 1.25 }, Sine, InOut)
+			tweenOne("OrbitRadius", OrbitRadiusScale, 2.2, { Value = 1.1 }, Sine, InOut)
 		end)
 		later(0.3, function()
-			tweenOne("OrbitSpeed", OrbitSpeedValue, 2.5, { Value = 1 }, Sine, Out)
+			tweenOne("OrbitSpeed", OrbitSpeedScale, 2.5, { Value = 1 }, Sine, Out)
 		end)
 
 		--// ==============================
 		--//  STAGE 5: HOLD
+		--//  faint sustained rumble, lightning keeps cracking now and then
 		--// ==============================
 
-		shake(1.1, 3, 1, MainHold) --// faint lingering rumble
+		if Shaker and Feel > 0 then
+			local ok, instance = pcall(Shaker.StartShake, Shaker, 1.1 * Intensity * Feel, 3, 1)
+			if ok then
+				Rumble = instance
+			end
+		end
+
+		later(Beats * BeatGap + 0.3, function()
+			while Alive do
+				task.wait(StrikeGapMin + math.random() * (StrikeGapMax - StrikeGapMin))
+				if Alive then
+					strike(0.35 + math.random() * 0.4)
+				end
+			end
+		end)
+
 		hold(MainHold)
 	end
 
