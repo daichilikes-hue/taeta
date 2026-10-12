@@ -64,9 +64,16 @@ local OrbitBob = 1.2; --// gentle up and down drift
 local OrbitTiltMin, OrbitTiltMax = 12, 32; --// degrees each orbit ring is tipped
 local OrbitMaxDip = 6; --// big rings get tipped less so they never dip more than this far down
 
---// Time stop (TimeStopAtmosphere + lightning, from the folder)
-local TimeStopFade = 0.35; --// how fast the time stop look comes in on the reveal
-local StrikeGapMin, StrikeGapMax = 0.5, 1.3; --// seconds between lightning strikes during the hold
+--// Time stop (TimeStopAtmosphere + lightning, from the folder): the very start, through Fly In, gone on the flash
+local TimeStopFade = 0.35; --// how fast the time stop look comes in at the start
+local StrikeGapMin, StrikeGapMax = 0.35, 0.9; --// seconds between lightning strikes during Fly In
+
+--// Blur during Fly In: hits at the start, then eases down to just a touch by the landing
+local FlyInBlurPeak = 14
+local FlyInBlurEnd = 3
+
+--// "Model" in the folder: there through Fly In, stops emitting when Main starts, gone this many seconds after
+local IntroModelLinger = 3
 
 --// ==============================
 --//
@@ -408,6 +415,7 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 	--// Where the screen sits between beats. Beats always come back to this.
 	local Rest = {
+		Blur = 0,
 		Fov = 0,
 		Vignette = 1,
 		Grade = { Brightness = 0, Contrast = 0, Saturation = 0 },
@@ -442,7 +450,11 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 	local function blurPulse(size, time)
 		Blur.Size = math.max(Blur.Size, size * Intensity * Feel)
-		tweenOne("Blur", Blur, time, { Size = 0 }, Quad, Out)
+		tweenOne("Blur", Blur, time, { Size = Rest.Blur * Intensity * Feel }, Quad, Out)
+	end
+
+	local function blurTo(size, time, style, direction)
+		tweenOne("Blur", Blur, time, { Size = size * Intensity * Feel }, style, direction)
 	end
 
 	local function shake(magnitude, roughness, fadeIn, fadeOut)
@@ -797,6 +809,69 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		shake(1.5 * power, 14, 0, 0.25)
 	end
 
+	--// lightning stops cracking: emitters/beams off, lights die, gone once its particles are done
+	local function endLightning(time)
+		if not Lightning or not Lightning.Parent then
+			return
+		end
+		local Old = Lightning
+		Lightning = nil --// stops any more strikes
+		setEmitters(Old, false)
+		for light in pairs(LightningLights) do
+			if light.Parent then
+				TweenService:Create(light, TweenInfo.new(time), { Brightness = 0 }):Play()
+			end
+		end
+		task.delay(time + math.min(longestLife(Old), 6) + 0.5, Old.Destroy, Old)
+	end
+
+	--// ==============================
+	--//
+	--//  INTRO MODEL ("Model" in the folder, there while he flies in)
+	--//
+	--// ==============================
+
+	local IntroModelTemplate = Folder:FindFirstChild("Model")
+	local IntroModel
+
+	local function spawnIntroModel()
+		if not (IntroModelTemplate and IntroModelTemplate:IsA("PVInstance")) then
+			warn("StompModule: no 'Model' found in the folder, skipping it")
+			return
+		end
+		IntroModel = IntroModelTemplate:Clone()
+		for _, p in ipairs(partsOf(IntroModel)) do
+			noPhysics(p)
+		end
+		place(IntroModel, CFrame.new(SpawnCFrame.Position) * IntroModel:GetPivot().Rotation)
+		IntroModel.Parent = workspace
+		--// emitters with an EmitCount attribute get a burst on top of whatever is already streaming
+		for _, v in ipairs(IntroModel:GetDescendants()) do
+			if v:IsA("ParticleEmitter") and v:GetAttribute("EmitCount") then
+				task.delay(v:GetAttribute("EmitDelay") or 0, function()
+					if v.Parent then
+						v:Emit(v:GetAttribute("EmitCount"))
+					end
+				end)
+			end
+		end
+	end
+
+	--// particles and beams off, then it goes IntroModelLinger seconds later
+	local function endIntroModel()
+		if not IntroModel then
+			return
+		end
+		local Old = IntroModel
+		IntroModel = nil
+		for _, v in ipairs(Old:GetDescendants()) do
+			if v:IsA("ParticleEmitter") or v:IsA("Beam") then
+				v.Enabled = false
+			end
+		end
+		task.delay(IntroModelLinger, Old.Destroy, Old)
+	end
+
 	--// ==============================
 	--//
 	--//  MAP HIDE / RESTORE
@@ -853,6 +928,8 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		end
 		restoreMap()
 		undoTimeStop(Time)
+		endLightning(Time)
+		endIntroModel()
 
 		--// screen eases back to exactly how it was
 		tweenOne("Fov", Camera, Time, { FieldOfView = OriginalFov }, Sine, InOut)
@@ -884,7 +961,7 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 		--// Main VFX and lightning stop emitting and their lights die down, then they go once the particles are done
 		local EffectLife = 0
-		for _, Effect in ipairs({ MainModel, Lightning }) do
+		for _, Effect in ipairs({ MainModel }) do
 			if Effect and Effect.Parent then
 				setEmitters(Effect, false)
 				EffectLife = math.max(EffectLife, math.min(longestLife(Effect), 6))
@@ -914,9 +991,6 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		task.delay(Time + EffectLife + 0.5, function()
 			if MainModel then
 				MainModel:Destroy()
-			end
-			if Lightning then
-				Lightning:Destroy()
 			end
 		end)
 
@@ -952,13 +1026,40 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 	local function run()
 		--// ==============================
-		--//  STAGE 1: FLY IN
-		--//  ghost rig, StartTrails close in, view tightens, vignette creeps in, colour drains a bit
+		--//  STAGE 1: TIME STOP + FLY IN
+		--//  time stops (atmosphere, lightning, the intro Model), ghost rig flies in, StartTrails close in,
+		--//  view tightens, vignette creeps in, colour drains a bit, blur hits then eases to just a touch
 		--// ==============================
 
 		FlyInTrack:Play()
 		local FlyInLength = FlyInTrack.Length > 0 and FlyInTrack.Length or 1
 		local WindTime = math.max(FlyInLength, 0.7)
+
+		if TimeStopTemplate and Feel > 0 then
+			applyTimeStopPiece(TimeStopTemplate, TimeStopFade)
+		end
+		spawnIntroModel()
+		spawnLightning()
+		flash(0.6 * Intensity * Feel, 0.35)
+		strike(1)
+		shake(3, 12, 0.02, 0.5) --// the jolt of time stopping
+
+		--// lightning keeps cracking while he flies in
+		task.spawn(function()
+			while Alive and Lightning do
+				task.wait(StrikeGapMin + math.random() * (StrikeGapMax - StrikeGapMin))
+				if Alive then
+					strike(0.4 + math.random() * 0.4)
+				end
+			end
+		end)
+
+		--// blur hits with the time stop, then eases down to a little for taste by the landing
+		Rest.Blur = FlyInBlurEnd
+		blurTo(FlyInBlurPeak, 0.25, Quad, Out)
+		later(0.25, function()
+			blurTo(FlyInBlurEnd, math.max(WindTime - 0.25, 0.3), Sine, InOut)
+		end)
 
 		local StartTrails = spawnOrbitGroup("StartTrail", StartTrailCount, StartTrailRadius, StartTrailRadius * 2, WindTime, math.min(WindTime, 0.8))
 
@@ -984,6 +1085,13 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 		flash(Intensity * Feel)
 		solidRig()
+
+		--// time starts again: last crack of lightning, the look eases out, the intro Model stops emitting
+		strike(1)
+		task.delay(0.15, endLightning, 0.4)
+		undoTimeStop(0.5)
+		endIntroModel()
+		Rest.Blur = 0 --// the landing beat's blur fades all the way out
 		releaseOrbitGroup(StartTrails, 0.25)
 		spawnOrbitGroup("WhiteTrail", WhiteTrailCount, WhiteTrailRadius, WhiteTrailRadius * 0.4, 1.1, 0.25)
 		MainTrack:Play()
@@ -1035,18 +1143,14 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 		--// ==============================
 		--//
-		--//  STAGE 4: THE REVEAL / TIME STOP (the main part of the stomp)
+		--//  STAGE 4: THE REVEAL (the main part of the stomp)
 		--//
 		--// ==============================
 
 		if Feel > 0 then
 			hideMap()
-			if TimeStopTemplate then
-				applyTimeStopPiece(TimeStopTemplate, TimeStopFade)
-			end
 		end
 		flash(1.2 * Intensity * Feel, 0.5)
-		spawnLightning()
 
 		--// raise the Main VFX from under the ground to just under the rig
 		if MainModel and MainModel.Parent then
@@ -1067,11 +1171,11 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 			RiseTween:Play()
 		end
 
-		--// the toll: a big in-and-out, then two smaller echoes, lightning cracking on each
+		--// the toll: a big in-and-out, then two smaller echoes
 		Rest.Fov = MainFov
 		Rest.Vignette = 0.12
 		Rest.Grade = MainLook
-		toll(1, strike)
+		toll(1)
 		shake(2.5, 6, 0.1, 2.5) --// long tail under the beats
 
 		--// bloom spike
@@ -1092,7 +1196,7 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 		--// ==============================
 		--//  STAGE 5: HOLD
-		--//  faint sustained rumble, lightning keeps cracking now and then
+		--//  faint sustained rumble
 		--// ==============================
 
 		if Shaker and Feel > 0 then
@@ -1101,15 +1205,6 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 				Rumble = instance
 			end
 		end
-
-		later(Beats * BeatGap + 0.3, function()
-			while Alive do
-				task.wait(StrikeGapMin + math.random() * (StrikeGapMax - StrikeGapMin))
-				if Alive then
-					strike(0.35 + math.random() * 0.4)
-				end
-			end
-		end)
 
 		hold(MainHold)
 	end
