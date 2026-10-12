@@ -85,6 +85,13 @@ local ScreenEffectLife = 30
 --// "Model" in the folder: there through Fly In, stops emitting when Main starts, gone this many seconds after
 local IntroModelLinger = 3
 
+--// "WindBeamUp" in the folder: there through Fly In, turned to face the way the rig is flying in from,
+--// stops emitting when Main starts and goes IntroModelLinger seconds later
+local WindBeamFlip = false; --// true if it ends up pointing at where he's flying TO instead of FROM
+local WindBeamYawOnly = false; --// true = only turn it left/right, never tip it up/down
+local WindBeamTurn = Vector3.new(0, 0, 0); --// extra rotation in degrees if the model's front isn't its LookVector
+local WindBeamTurnSpeed = 10; --// how quickly it swings to follow the flight path
+
 --// ==============================
 --//
 --//  HELPERS
@@ -943,6 +950,92 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 	--// ==============================
 	--//
+	--//  WIND BEAM UP (faces where the rig is flying in from)
+	--//
+	--// ==============================
+
+	local WindBeamTemplate = Folder:FindFirstChild("WindBeamUp")
+	local WindBeam
+	local WindBeamConnection
+	local WindBeamExtra = CFrame.Angles(math.rad(WindBeamTurn.X), math.rad(WindBeamTurn.Y), math.rad(WindBeamTurn.Z))
+
+	--// The fly in is an animation, so the rig's root stays on the landing spot while the torso is
+	--// animated in from somewhere else. The way he's coming from is landing spot -> animated torso.
+	local function flightDirection()
+		if not (CenterPart and CenterPart.Parent) then
+			return nil
+		end
+		local Offset = CenterPart.Position - SpawnCFrame.Position
+		if WindBeamYawOnly then
+			Offset = Vector3.new(Offset.X, 0, Offset.Z)
+		end
+		if Offset.Magnitude < 2 then
+			return nil --// basically landed, keep the last direction
+		end
+		return (WindBeamFlip and -Offset or Offset).Unit
+	end
+
+	local function windBeamCFrame(direction)
+		local Position = SpawnCFrame.Position
+		--// a straight up/down path can't use the world up as its up vector
+		local Up = math.abs(direction.Y) > 0.99 and Vector3.new(0, 0, 1) or Vector3.new(0, 1, 0)
+		return CFrame.lookAt(Position, Position + direction, Up) * WindBeamExtra
+	end
+
+	local function spawnWindBeam()
+		if not (WindBeamTemplate and WindBeamTemplate:IsA("PVInstance")) then
+			warn("StompModule: no 'WindBeamUp' found in the folder, skipping it")
+			return
+		end
+		WindBeam = WindBeamTemplate:Clone()
+		for _, p in ipairs(partsOf(WindBeam)) do
+			noPhysics(p)
+		end
+		--// until the animation has moved him, face the way the rig itself faces
+		local Facing = flightDirection() or SpawnCFrame.LookVector
+		place(WindBeam, windBeamCFrame(Facing))
+		WindBeam.Parent = workspace
+		for _, v in ipairs(WindBeam:GetDescendants()) do
+			if v:IsA("ParticleEmitter") and v:GetAttribute("EmitCount") then
+				task.delay(v:GetAttribute("EmitDelay") or 0, function()
+					if v.Parent then
+						v:Emit(v:GetAttribute("EmitCount"))
+					end
+				end)
+			end
+		end
+
+		--// swing smoothly to follow the flight path every frame while he flies in
+		local Current = windBeamCFrame(Facing)
+		WindBeamConnection = RunService.RenderStepped:Connect(function(dt)
+			if not (WindBeam and WindBeam.Parent) then
+				return
+			end
+			local Direction = flightDirection()
+			if Direction then
+				Current = Current:Lerp(windBeamCFrame(Direction), 1 - math.exp(-dt * WindBeamTurnSpeed))
+				place(WindBeam, Current)
+			end
+		end)
+	end
+
+	--// particles, beams and trails off, stops turning, then it goes IntroModelLinger seconds later
+	local function endWindBeam()
+		if WindBeamConnection then
+			WindBeamConnection:Disconnect()
+			WindBeamConnection = nil
+		end
+		if not WindBeam then
+			return
+		end
+		local Old = WindBeam
+		WindBeam = nil
+		setEmitters(Old, false)
+		task.delay(IntroModelLinger, Old.Destroy, Old)
+	end
+
+	--// ==============================
+	--//
 	--//  MAP HIDE / RESTORE
 	--//
 	--// ==============================
@@ -999,6 +1092,7 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		undoTimeStop(Time)
 		endLightning(Time)
 		endIntroModel()
+		endWindBeam()
 
 		--// screen eases back to exactly how it was
 		tweenOne("Fov", Camera, Time, { FieldOfView = OriginalFov }, Sine, InOut)
@@ -1108,6 +1202,7 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 			applyTimeStopPiece(TimeStopTemplate, TimeStopFade)
 		end
 		spawnIntroModel()
+		spawnWindBeam()
 		spawnLightning()
 
 		--// ScreenEffect, same as Grand Sand Mausoleum: clone it into workspace and fire it through ForgeVFX
@@ -1173,6 +1268,7 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 			undoTimeStop(StartFadeOut)
 		end)
 		endIntroModel()
+		endWindBeam()
 		Rest.Blur = 0 --// the landing beat's blur fades all the way out
 		releaseOrbitGroup(StartTrails, 0.25)
 		spawnOrbitGroup("WhiteTrail", WhiteTrailCount, WhiteTrailRadius, WhiteTrailRadius * 0.4, 1.1, 0.25)
