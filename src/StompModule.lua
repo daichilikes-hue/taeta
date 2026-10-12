@@ -1,0 +1,834 @@
+--!nonstrict
+local EffectsModule = {}
+
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local Players = game:GetService("Players")
+
+local Sine, Quad, Quint = Enum.EasingStyle.Sine, Enum.EasingStyle.Quad, Enum.EasingStyle.Quint
+local In, Out, InOut = Enum.EasingDirection.In, Enum.EasingDirection.Out, Enum.EasingDirection.InOut
+
+--// ==============================
+--//
+--//  TUNING
+--//
+--// ==============================
+
+local Intensity = 1; --// master punch for flashes, shake, blur and bloom
+local RevealDelay = 5; --// seconds into Main before the reveal
+local MainHold = 7; --// seconds the reveal stays up before everything eases back
+local OutroTime = 0.9; --// how long the ease back takes
+local Linger = 3; --// extra seconds stuff stays alive so particles/trails dont get cut off
+
+--// the farther you are from it, the less it hits your screen
+local NearDistance, FarDistance = 120, 420
+
+--// Main VFX model
+local MainStartDrop = 250; --// studs under the rig while its VFX warm up
+local MainEndDrop = 10; --// studs under the rig after the reveal
+
+--// Screen look while Fly In lands
+local WindFov = 10; --// degrees the view tightens during Fly In
+local MainFov = 12; --// degrees the view opens up during Main
+local BuildFov = 4; --// Main slowly tightens back to this right before the reveal
+local MainLook = { Brightness = 0.025, Contrast = 0.3, Saturation = 0.4 } --// no colour tint, just punch
+
+--// The reveal tolls like Grave Bells: in and out this many times, each one smaller
+local Beats = 3
+local BeatGap = 0.42
+local BeatFade = 0.58; --// each beat this much of the one before
+local FovIn = 7; --// degrees the view snaps in on a beat ...
+local FovOut = 6; --// ... and kicks out past rest right after
+local BeatShake = 5
+local BeatBlur = 10
+local BeatDrain = 0.45; --// colour drained on a beat
+local BeatContrast = 0.3
+local BeatVignette = 0.5; --// how far the vignette slams in on a beat
+
+--// WhiteTrail orbit around the character
+local TrailCount = 3
+local OrbitRadius = 7
+local OrbitStartRadius = 14; --// they start wide and close in during Fly In
+local OrbitSpeed = 0.9; --// radians per second, about 7 seconds a lap
+local OrbitHeight = 1; --// above the middle of the character
+local OrbitBob = 1.2; --// gentle up and down drift
+local OrbitTiltMin, OrbitTiltMax = 12, 32; --// degrees each orbit ring is tipped
+
+--// ==============================
+--//
+--//  HELPERS
+--//
+--// ==============================
+
+local function findAnimation(root, name)
+	if not root then
+		return nil
+	end
+	for _, descendant in ipairs(root:GetDescendants()) do
+		if descendant:IsA("Animation") and descendant.Name == name then
+			return descendant
+		end
+	end
+	return nil
+end
+
+local function findModel(root, name)
+	if not root then
+		return nil
+	end
+	for _, descendant in ipairs(root:GetDescendants()) do
+		if descendant:IsA("Model") and descendant.Name == name then
+			return descendant
+		end
+	end
+	return nil
+end
+
+local function noPhysics(part)
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+end
+
+--// every BasePart in a part or model (including itself)
+local function partsOf(root)
+	local list = {}
+	if root:IsA("BasePart") then
+		table.insert(list, root)
+	end
+	for _, v in ipairs(root:GetDescendants()) do
+		if v:IsA("BasePart") then
+			table.insert(list, v)
+		end
+	end
+	return list
+end
+
+local function setEmitters(root, enabled)
+	for _, v in ipairs(root:GetDescendants()) do
+		if v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Beam") then
+			v.Enabled = enabled
+		end
+	end
+end
+
+--// how long the longest particle/trail inside lives
+local function longestLife(root)
+	local life = 0
+	for _, v in ipairs(root:GetDescendants()) do
+		if v:IsA("ParticleEmitter") then
+			life = math.max(life, v.Lifetime.Max)
+		elseif v:IsA("Trail") then
+			life = math.max(life, v.Lifetime)
+		end
+	end
+	return life
+end
+
+local function place(object, cf)
+	if object:IsA("BasePart") then
+		object.CFrame = cf
+	else
+		object:PivotTo(cf)
+	end
+end
+
+local function flash(strength, time)
+	strength = strength or 1
+	time = time or 0.4
+	if strength <= 0 then
+		return
+	end
+	local effect = Instance.new("ColorCorrectionEffect")
+	effect.Brightness = 0.9 * strength
+	effect.Contrast = 0.65 * strength
+	effect.Saturation = -0.35 * strength
+	effect.Parent = Lighting
+	TweenService:Create(effect, TweenInfo.new(time, Sine, Out), {
+		Brightness = 0,
+		Contrast = 0,
+		Saturation = 0,
+	}):Play()
+	task.delay(time + 0.05, effect.Destroy, effect)
+end
+
+--// waits for a track to completely end, but never forever (animation failed to load, rig removed...)
+local function waitForTrack(track, timeout)
+	local done = false
+	local connection = track.Ended:Connect(function()
+		done = true
+	end)
+	local started = os.clock()
+	while not done and os.clock() - started < timeout do
+		task.wait()
+	end
+	connection:Disconnect()
+end
+
+--// 1 within NearDistance of the position, 0 past FarDistance
+local function nearness(position)
+	local Player = Players.LocalPlayer
+	local Character = Player and Player.Character
+	local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+	local Camera = workspace.CurrentCamera
+	local From = (Root and Root.Position) or (Camera and Camera.CFrame.Position) or position
+	local Distance = (From - position).Magnitude
+	if Distance <= NearDistance then
+		return 1
+	elseif Distance >= FarDistance then
+		return 0
+	end
+	return 1 - (Distance - NearDistance) / (FarDistance - NearDistance)
+end
+
+--// ==============================
+--//
+--//  THE STOMP
+--//
+--// ==============================
+
+function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRootPart (or any part/model to spawn on)
+	local Folder = script.Parent
+
+	local RigTemplate = Folder:FindFirstChild("Rig")
+	if not RigTemplate then
+		warn("StompModule: no 'Rig' model found in", Folder:GetFullName())
+		return
+	end
+
+	local Camera = workspace.CurrentCamera
+	local OriginalFov = Camera.FieldOfView
+
+	local SpawnCFrame
+	if typeof(Target) == "Instance" and Target:IsA("BasePart") then
+		SpawnCFrame = Target.CFrame
+	elseif typeof(Target) == "Instance" and Target:IsA("Model") then
+		SpawnCFrame = Target:GetPivot()
+	else
+		SpawnCFrame = CFrame.new()
+	end
+
+	--// Rig + animator
+
+	local Rig = RigTemplate:Clone()
+	place(Rig, SpawnCFrame)
+	Rig.Parent = workspace
+
+	local Animator
+	local AnimatorParent = Rig:FindFirstChildOfClass("Humanoid") or Rig:FindFirstChildOfClass("AnimationController")
+	if AnimatorParent then
+		Animator = AnimatorParent:FindFirstChildOfClass("Animator")
+		if not Animator then
+			Animator = Instance.new("Animator")
+			Animator.Parent = AnimatorParent
+		end
+	end
+	if not Animator then
+		warn("StompModule: Rig needs a Humanoid or AnimationController to play animations")
+		Rig:Destroy()
+		return
+	end
+
+	--// Search by class as well as name: the folder also contains a Model named Main.
+	local FlyInAnimation = findAnimation(Rig, "Fly In") or findAnimation(Folder, "Fly In")
+	local MainAnimation = findAnimation(Rig, "Main") or findAnimation(Folder, "Main")
+	local MainModelTemplate = findModel(Folder, "Main")
+	if not FlyInAnimation or not MainAnimation then
+		warn("StompModule: couldn't find an Animation named '" .. (FlyInAnimation and "Main" or "Fly In") .. "'")
+		Rig:Destroy()
+		return
+	end
+
+	local FlyInTrack = Animator:LoadAnimation(FlyInAnimation)
+	local MainTrack = Animator:LoadAnimation(MainAnimation)
+	FlyInTrack.Looped = false
+	MainTrack.Looped = true
+
+	--// Spawn the Main VFX deep under the rig right away so its effects can warm up before the reveal.
+	local MainModel
+	if MainModelTemplate then
+		MainModel = MainModelTemplate:Clone()
+		MainModel:PivotTo(SpawnCFrame + Vector3.new(0, -MainStartDrop, 0))
+		MainModel.Parent = workspace
+	end
+
+	--// ==============================
+	--//
+	--//  STAGE 0: SCREEN SETUP
+	--//
+	--// ==============================
+
+	local Alive = true
+	local Feel = nearness(SpawnCFrame.Position) --// how hard the screen stuff hits this player (0..1)
+
+	local Player = Players.LocalPlayer
+	local PlayerGui = Player and Player:FindFirstChildOfClass("PlayerGui")
+	local ScreenGuiTemplate = Folder:FindFirstChild("ScreenGui")
+	local ScreenGui
+	local Vignette
+	if PlayerGui and ScreenGuiTemplate then
+		ScreenGui = ScreenGuiTemplate:Clone()
+		ScreenGui.Parent = PlayerGui
+		local VignetteContainer = ScreenGui:FindFirstChild("Vignette", true)
+		Vignette = VignetteContainer and VignetteContainer:FindFirstChild("ImageLabel", true)
+		if Vignette and Vignette:IsA("ImageLabel") then
+			Vignette.ImageTransparency = 1
+		else
+			Vignette = nil
+		end
+	end
+
+	--// swap any bloom already in Lighting for our own so we can push it around
+	local OldBlooms = {}
+	for _, v in ipairs(Lighting:GetChildren()) do
+		if v:IsA("BloomEffect") and v.Enabled then
+			v.Enabled = false
+			table.insert(OldBlooms, v)
+		end
+	end
+
+	local Bloom = Instance.new("BloomEffect")
+	Bloom.Intensity = 0.4
+	Bloom.Size = 24
+	Bloom.Threshold = 0.9
+	Bloom.Parent = Lighting
+
+	local Grade = Instance.new("ColorCorrectionEffect")
+	Grade.Parent = Lighting
+
+	local Blur = Instance.new("BlurEffect")
+	Blur.Size = 0
+	Blur.Parent = Lighting
+
+	--// CameraShaker (optional)
+	local Shaker
+	local CameraShakerModule = script:FindFirstChild("CameraShaker")
+	if CameraShakerModule and CameraShakerModule:IsA("ModuleScript") then
+		local ok, CameraShaker = pcall(require, CameraShakerModule)
+		if ok and CameraShaker then
+			local created, result = pcall(function()
+				local instance = CameraShaker.new(Enum.RenderPriority.Camera.Value, function(shakeCFrame)
+					local CurrentCamera = workspace.CurrentCamera
+					if CurrentCamera then
+						CurrentCamera.CFrame *= shakeCFrame
+					end
+				end)
+				instance:Start()
+				return instance
+			end)
+			if created then
+				Shaker = result
+			end
+		end
+	end
+
+	--// One tween per thing at a time: a new one cancels the old one, so overlapping beats hand off smoothly.
+	local Tweens = {}
+	local function tweenOne(key, instance, time, goal, style, direction)
+		if not instance then
+			return nil
+		end
+		local old = Tweens[key]
+		if old then
+			old:Cancel()
+		end
+		local tween = TweenService:Create(instance, TweenInfo.new(time, style or Sine, direction or Out), goal)
+		Tweens[key] = tween
+		tween:Play()
+		return tween
+	end
+
+	--// runs later, but only if the stomp is still going
+	local function later(seconds, callback)
+		task.delay(seconds, function()
+			if Alive then
+				callback()
+			end
+		end)
+	end
+
+	--// Where the screen sits between beats. Beats always come back to this.
+	local Rest = {
+		Fov = 0,
+		Vignette = 1,
+		Grade = { Brightness = 0, Contrast = 0, Saturation = 0 },
+	}
+
+	local function fov(offset, time, style, direction)
+		tweenOne("Fov", Camera, time, {
+			FieldOfView = math.clamp(OriginalFov + offset * Feel, 20, 120),
+		}, style, direction)
+	end
+
+	local function grade(goal, time, style, direction)
+		tweenOne("Grade", Grade, time, {
+			Brightness = goal.Brightness * Feel,
+			Contrast = goal.Contrast * Feel,
+			Saturation = goal.Saturation * Feel,
+		}, style, direction)
+	end
+
+	local function vignette(transparency, time, style, direction)
+		tweenOne("Vignette", Vignette, time, {
+			ImageTransparency = 1 - (1 - transparency) * Feel,
+		}, style, direction)
+	end
+
+	local function bloom(intensity, size, time, style, direction)
+		tweenOne("Bloom", Bloom, time, {
+			Intensity = 0.4 + (intensity - 0.4) * Feel,
+			Size = 24 + (size - 24) * Feel,
+		}, style, direction)
+	end
+
+	local function blurPulse(size, time)
+		Blur.Size = math.max(Blur.Size, size * Intensity * Feel)
+		tweenOne("Blur", Blur, time, { Size = 0 }, Quad, Out)
+	end
+
+	local function shake(magnitude, roughness, fadeIn, fadeOut)
+		if Shaker and Feel > 0 then
+			pcall(Shaker.ShakeOnce, Shaker, magnitude * Intensity * Feel, roughness, fadeIn, fadeOut)
+		end
+	end
+
+	--// One beat: snap in, kick out past rest, settle back. Shake, blur, drain and vignette ride along.
+	local function beat(strength)
+		if not Alive then
+			return
+		end
+		fov(Rest.Fov - FovIn * strength, 0.07, Quad, Out)
+		later(0.1, function()
+			fov(Rest.Fov + FovOut * strength, 0.16, Sine, Out)
+			later(0.18, function()
+				fov(Rest.Fov, 0.35, Sine, InOut)
+			end)
+		end)
+
+		shake(BeatShake * strength, 11, 0.02, 0.4)
+		blurPulse(BeatBlur * strength, 0.45)
+		grade({
+			Brightness = Rest.Grade.Brightness - 0.04 * strength,
+			Contrast = Rest.Grade.Contrast + BeatContrast * strength,
+			Saturation = Rest.Grade.Saturation - BeatDrain * strength,
+		}, 0.06, Quad, Out)
+		vignette(math.max(0, Rest.Vignette - BeatVignette * strength), 0.06, Quad, Out)
+
+		later(0.12, function()
+			grade(Rest.Grade, 0.34)
+			vignette(Rest.Vignette, 0.34)
+		end)
+	end
+
+	--// a big beat, then smaller echoes
+	local function toll(strength)
+		for index = 1, Beats do
+			later((index - 1) * BeatGap, function()
+				beat(strength * BeatFade ^ (index - 1))
+			end)
+		end
+	end
+
+	--// ==============================
+	--//
+	--//  WHITE TRAILS (slow orbit around the character)
+	--//
+	--// ==============================
+
+	local CenterPart = Rig:FindFirstChild("UpperTorso", true)
+		or Rig:FindFirstChild("Torso", true)
+		or Rig:FindFirstChild("HumanoidRootPart", true)
+		or (Rig:IsA("Model") and Rig.PrimaryPart)
+		or (Rig:IsA("BasePart") and Rig)
+
+	local function getCenter()
+		if CenterPart and CenterPart.Parent then
+			return CenterPart.Position
+		end
+		return SpawnCFrame.Position
+	end
+
+	local OrbitRadiusValue = Instance.new("NumberValue")
+	OrbitRadiusValue.Value = OrbitStartRadius
+	local OrbitSpeedValue = Instance.new("NumberValue")
+	OrbitSpeedValue.Value = 1
+
+	local Orbiters = {}
+	local OrbitClock = 0
+	local SmoothCenter = nil
+	local OrbitConnection = nil
+
+	local WhiteTrailTemplate = Folder:FindFirstChild("WhiteTrail")
+	if WhiteTrailTemplate and (WhiteTrailTemplate:IsA("BasePart") or WhiteTrailTemplate:IsA("Model")) then
+		for i = 1, TrailCount do
+			local Object = WhiteTrailTemplate:Clone()
+			local Fade = {}
+			for _, p in ipairs(partsOf(Object)) do
+				noPhysics(p)
+				Fade[p] = p.Transparency
+				p.Transparency = 1
+			end
+			setEmitters(Object, false)
+
+			local Step = (i - 1) / math.max(TrailCount - 1, 1)
+			table.insert(Orbiters, {
+				Object = Object,
+				Fade = Fade,
+				Angle = (i - 1) * (2 * math.pi / TrailCount),
+				--// alternate the tip so the rings cross each other instead of stacking
+				Tilt = math.rad(OrbitTiltMin + (OrbitTiltMax - OrbitTiltMin) * Step) * (i % 2 == 0 and -1 or 1),
+				Yaw = (i - 1) * (2 * math.pi / TrailCount) * 0.5,
+				Phase = i * 1.7,
+				SpeedScale = 0.85 + 0.3 * Step, --// slightly different speeds so they drift past each other
+			})
+		end
+	elseif not WhiteTrailTemplate then
+		warn("StompModule: no 'WhiteTrail' found in the folder, skipping the orbit")
+	end
+
+	local function orbitCFrame(orbiter, center, radius)
+		local a = orbiter.Angle
+		local Plane = CFrame.Angles(0, orbiter.Yaw, 0) * CFrame.Angles(orbiter.Tilt, 0, 0)
+		local Offset = Plane:VectorToWorldSpace(Vector3.new(math.cos(a) * radius, 0, math.sin(a) * radius))
+		local Tangent = Plane:VectorToWorldSpace(Vector3.new(-math.sin(a), 0, math.cos(a)))
+		local Bob = math.sin(OrbitClock * 0.8 + orbiter.Phase) * OrbitBob
+		local Position = center + Offset + Vector3.new(0, OrbitHeight + Bob, 0)
+		return CFrame.lookAt(Position, Position + Tangent) --// faces where its going so the trail stays wide
+	end
+
+	local function spawnOrbiters(fadeTime)
+		if #Orbiters == 0 then
+			return
+		end
+		SmoothCenter = getCenter()
+		for _, o in ipairs(Orbiters) do
+			--// placed before parenting/enabling so the trail doesnt streak in from the template's spot
+			place(o.Object, orbitCFrame(o, SmoothCenter, OrbitRadiusValue.Value))
+			o.Object.Parent = workspace
+			setEmitters(o.Object, true)
+			for p, transparency in pairs(o.Fade) do
+				TweenService:Create(p, TweenInfo.new(fadeTime), { Transparency = transparency }):Play()
+			end
+		end
+
+		OrbitConnection = RunService.RenderStepped:Connect(function(dt)
+			OrbitClock += dt
+			--// smoothed so the orbit glides with the character instead of snapping with every animation pose
+			SmoothCenter = SmoothCenter:Lerp(getCenter(), 1 - math.exp(-dt * 6))
+			local Radius = OrbitRadiusValue.Value
+			local Speed = OrbitSpeed * OrbitSpeedValue.Value
+			for _, o in ipairs(Orbiters) do
+				if o.Object.Parent then
+					o.Angle += dt * Speed * o.SpeedScale
+					place(o.Object, orbitCFrame(o, SmoothCenter, Radius))
+				end
+			end
+		end)
+	end
+
+	local function releaseOrbiters(time)
+		local Life = 0
+		for _, o in ipairs(Orbiters) do
+			setEmitters(o.Object, false) --// existing trail segments still fade out naturally
+			Life = math.max(Life, longestLife(o.Object))
+			for p in pairs(o.Fade) do
+				if p.Parent then
+					TweenService:Create(p, TweenInfo.new(time), { Transparency = 1 }):Play()
+				end
+			end
+		end
+		--// keep them circling while they fade, then clean up
+		task.delay(time + math.min(Life, 5) + 0.2, function()
+			if OrbitConnection then
+				OrbitConnection:Disconnect()
+				OrbitConnection = nil
+			end
+			for _, o in ipairs(Orbiters) do
+				o.Object:Destroy()
+			end
+			OrbitRadiusValue:Destroy()
+			OrbitSpeedValue:Destroy()
+		end)
+	end
+
+	--// ==============================
+	--//
+	--//  MAP HIDE / RESTORE
+	--//
+	--// ==============================
+
+	local SavedMapTransparency = {}
+
+	local function hideMap()
+		local Map = workspace:FindFirstChild("Map")
+		if not Map then
+			return
+		end
+		for _, descendant in ipairs(Map:GetDescendants()) do
+			if descendant:IsA("BasePart") or descendant:IsA("Decal") or descendant:IsA("Texture") then
+				table.insert(SavedMapTransparency, {
+					Instance = descendant,
+					Transparency = descendant.Transparency,
+				})
+				descendant.Transparency = 1
+			end
+		end
+	end
+
+	local function restoreMap()
+		for _, saved in ipairs(SavedMapTransparency) do
+			if saved.Instance and saved.Instance.Parent then
+				saved.Instance.Transparency = saved.Transparency
+			end
+		end
+		table.clear(SavedMapTransparency)
+	end
+
+	--// ==============================
+	--//
+	--//  CLEANUP (always runs, even if something errors)
+	--//
+	--// ==============================
+
+	local Finished = false
+	local function finish(quick)
+		if Finished then
+			return
+		end
+		Finished = true
+		Alive = false --// stops any beats still queued up
+
+		local Time = quick and 0.2 or OutroTime
+
+		--// a soft flash covers the map popping back in
+		if #SavedMapTransparency > 0 and not quick then
+			flash(0.6 * Intensity * Feel, 0.5)
+		end
+		restoreMap()
+
+		--// screen eases back to exactly how it was
+		Rest.Fov, Rest.Vignette = 0, 1
+		Rest.Grade = { Brightness = 0, Contrast = 0, Saturation = 0 }
+		tweenOne("Fov", Camera, Time, { FieldOfView = OriginalFov }, Sine, InOut)
+		tweenOne("Grade", Grade, Time, { Brightness = 0, Contrast = 0, Saturation = 0 })
+		tweenOne("Vignette", Vignette, Time, { ImageTransparency = 1 })
+		tweenOne("Blur", Blur, Time, { Size = 0 })
+		tweenOne("Bloom", Bloom, Time, { Intensity = 0, Size = 24 })
+
+		releaseOrbiters(Time)
+
+		pcall(function()
+			FlyInTrack:Stop(0)
+			MainTrack:Stop(Time)
+		end)
+
+		--// rig fades out instead of popping
+		local RigFade = Rig:GetDescendants()
+		table.insert(RigFade, Rig)
+		for _, v in ipairs(RigFade) do
+			if (v:IsA("BasePart") or v:IsA("Decal")) and v.Transparency < 1 then
+				TweenService:Create(v, TweenInfo.new(Time), { Transparency = 1 }):Play()
+			end
+		end
+
+		--// Main VFX stops emitting and its lights die down, then it goes once the particles are done
+		local MainLife = 0
+		if MainModel and MainModel.Parent then
+			setEmitters(MainModel, false)
+			MainLife = math.min(longestLife(MainModel), 6)
+			for _, v in ipairs(MainModel:GetDescendants()) do
+				if v:IsA("Light") then
+					TweenService:Create(v, TweenInfo.new(Time), { Brightness = 0 }):Play()
+				end
+			end
+		end
+
+		task.delay(Time + 0.1, function()
+			if ScreenGui then
+				ScreenGui:Destroy()
+			end
+			Grade:Destroy()
+			Blur:Destroy()
+			Bloom:Destroy()
+			for _, v in ipairs(OldBlooms) do
+				if v and v.Parent then
+					v.Enabled = true
+				end
+			end
+			Rig:Destroy()
+		end)
+
+		task.delay(Time + MainLife + 0.5, function()
+			if MainModel then
+				MainModel:Destroy()
+			end
+		end)
+
+		--// let the last shakes die out before unbinding the shaker
+		task.delay(Time + Linger, function()
+			if Shaker then
+				pcall(Shaker.Stop, Shaker)
+			end
+		end)
+	end
+
+	--// waits, and says whether the stomp is still going
+	local function hold(seconds)
+		task.wait(seconds)
+		return Alive and Rig.Parent ~= nil
+	end
+
+	--// ==============================
+	--//
+	--//  TIMELINE
+	--//
+	--// ==============================
+
+	local function run()
+		--// ==============================
+		--//  STAGE 1: FLY IN
+		--//  view tightens, vignette creeps in, colour drains a bit, trails close in around the rig
+		--// ==============================
+
+		FlyInTrack:Play()
+		local FlyInLength = FlyInTrack.Length > 0 and FlyInTrack.Length or 1
+		local WindTime = math.max(FlyInLength, 0.7)
+
+		spawnOrbiters(math.min(WindTime, 0.8))
+		tweenOne("OrbitRadius", OrbitRadiusValue, WindTime, { Value = OrbitRadius }, Quad, Out)
+
+		Rest.Fov = -WindFov
+		Rest.Vignette = 0.45
+		Rest.Grade = { Brightness = -0.03, Contrast = 0.12, Saturation = -0.2 }
+		fov(Rest.Fov, WindTime, Sine, In)
+		vignette(Rest.Vignette, WindTime, Sine, In)
+		grade(Rest.Grade, WindTime, Sine, In)
+		bloom(0.9, 40, WindTime, Sine, In)
+		shake(1.2, 4, WindTime * 0.8, 0.4) --// low rumble that builds into the landing
+
+		--// Don't transition until Fly In has completely ended.
+		waitForTrack(FlyInTrack, 15)
+		if not (Alive and Rig.Parent) then
+			return
+		end
+
+		--// ==============================
+		--//  STAGE 2: LANDING -> MAIN
+		--//  flash, one beat, and the view opens up into the Main look
+		--// ==============================
+
+		flash(Intensity * Feel)
+		MainTrack:Play()
+
+		Rest.Fov = MainFov
+		Rest.Vignette = 0.2
+		Rest.Grade = MainLook
+		beat(0.6)
+		shake(2.5, 5, 0.1, 0.8)
+		later(0.15, function()
+			grade(Rest.Grade, 1.1)
+		end)
+		bloom(1.2, 44, 0.6)
+
+		--// trails get a little nudge from the landing, then settle back to their slow pace
+		tweenOne("OrbitSpeed", OrbitSpeedValue, 0.2, { Value = 1.6 }, Quad, Out)
+		later(0.2, function()
+			tweenOne("OrbitSpeed", OrbitSpeedValue, 1.5, { Value = 1 }, Sine, Out)
+		end)
+
+		if not hold(0.8) then
+			return
+		end
+
+		--// ==============================
+		--//  STAGE 3: BUILD
+		--//  everything slowly pulls in before the reveal
+		--// ==============================
+
+		local BuildTime = math.max(RevealDelay - 0.8, 0.5)
+		Rest.Fov = BuildFov
+		Rest.Vignette = 0.08
+		Rest.Grade = { Brightness = MainLook.Brightness - 0.02, Contrast = MainLook.Contrast + 0.1, Saturation = MainLook.Saturation - 0.1 }
+		fov(Rest.Fov, BuildTime, Sine, In)
+		vignette(Rest.Vignette, BuildTime, Sine, In)
+		grade(Rest.Grade, BuildTime, Sine, In)
+		bloom(1.6, 52, BuildTime, Sine, In)
+		shake(1.6, 3, BuildTime, 0.4) --// rumble swells right up to the hit
+		tweenOne("OrbitRadius", OrbitRadiusValue, BuildTime, { Value = OrbitRadius * 0.7 }, Sine, In)
+
+		if not hold(BuildTime) then
+			return
+		end
+
+		--// ==============================
+		--//
+		--//  STAGE 4: THE REVEAL (the main part of the stomp)
+		--//
+		--// ==============================
+
+		if Feel > 0 then
+			hideMap()
+		end
+		flash(1.2 * Intensity * Feel, 0.5)
+
+		--// raise the Main VFX from under the ground to just under the rig
+		if MainModel and MainModel.Parent then
+			local PivotDriver = Instance.new("CFrameValue")
+			PivotDriver.Value = MainModel:GetPivot()
+			local PivotConnection = PivotDriver:GetPropertyChangedSignal("Value"):Connect(function()
+				if MainModel.Parent then
+					MainModel:PivotTo(PivotDriver.Value)
+				end
+			end)
+			local RiseTween = TweenService:Create(PivotDriver, TweenInfo.new(1.4, Quint, Out), {
+				Value = SpawnCFrame + Vector3.new(0, -MainEndDrop, 0),
+			})
+			RiseTween.Completed:Connect(function()
+				PivotConnection:Disconnect()
+				PivotDriver:Destroy()
+			end)
+			RiseTween:Play()
+		end
+
+		--// the toll: a big in-and-out, then two smaller echoes
+		Rest.Fov = MainFov
+		Rest.Vignette = 0.12
+		Rest.Grade = MainLook
+		toll(1)
+		shake(2.5, 6, 0.1, 2.5) --// long tail under the beats
+
+		--// bloom spike
+		tweenOne("Bloom", Bloom, 0.08, { Intensity = 0.4 + 2.6 * Intensity * Feel, Size = 24 + 40 * Feel }, Quad, Out)
+		later(0.15, function()
+			bloom(1.2, 44, 1.4)
+		end)
+
+		--// trails get thrown wide by the blast, then drift back in at their slow pace
+		tweenOne("OrbitRadius", OrbitRadiusValue, 0.5, { Value = OrbitRadius * 1.6 }, Quint, Out)
+		tweenOne("OrbitSpeed", OrbitSpeedValue, 0.25, { Value = 1.8 }, Quad, Out)
+		later(0.6, function()
+			tweenOne("OrbitRadius", OrbitRadiusValue, 2.2, { Value = OrbitRadius * 1.25 }, Sine, InOut)
+		end)
+		later(0.3, function()
+			tweenOne("OrbitSpeed", OrbitSpeedValue, 2.5, { Value = 1 }, Sine, Out)
+		end)
+
+		--// ==============================
+		--//  STAGE 5: HOLD
+		--// ==============================
+
+		shake(1.1, 3, 1, MainHold) --// faint lingering rumble
+		hold(MainHold)
+	end
+
+	local ok, err = xpcall(run, debug.traceback)
+	if not ok then
+		warn("StompModule: " .. tostring(err))
+	end
+	finish(not ok)
+end
+
+return EffectsModule
