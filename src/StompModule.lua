@@ -72,6 +72,16 @@ local StrikeGapMin, StrikeGapMax = 0.35, 0.9; --// seconds between lightning str
 local FlyInBlurPeak = 14
 local FlyInBlurEnd = 3
 
+--// The start: chill but moody
+local StartShake = 0.5; --// the start's shakes at half strength
+local StartLook = { Brightness = 0, Contrast = 0.1, Saturation = -0.1 }
+local StartVignette = 0.4; --// vignette during Fly In (0 = black, 1 = none)
+local StartLinger = 1.2; --// seconds the time stop look + lightning hang on after the flash
+local StartFadeOut = 1; --// then how long they take to ease out
+
+--// "ScreenEffect" in the folder fires on the reveal through the ForgeVFX module under this script
+local ScreenEffectLife = 30
+
 --// "Model" in the folder: there through Fly In, stops emitting when Main starts, gone this many seconds after
 local IntroModelLinger = 3
 
@@ -216,6 +226,52 @@ local function nearness(position)
 		return 0
 	end
 	return 1 - (Distance - NearDistance) / (FarDistance - NearDistance)
+end
+
+--// the ForgeVFX module sitting under this script (any name like ForgeVFX / forge-vfx / Forge VFX)
+local ForgeVFX = nil
+do
+	local Module = script:FindFirstChild("ForgeVFX")
+	if not Module then
+		for _, child in ipairs(script:GetChildren()) do
+			local Squashed = (string.gsub(string.lower(child.Name), "[^%w]", ""))
+			if child:IsA("ModuleScript") and string.find(Squashed, "forgevfx", 1, true) then
+				Module = child
+				break
+			end
+		end
+	end
+	if Module then
+		local ok, result = pcall(require, Module)
+		if ok then
+			ForgeVFX = result
+		else
+			warn("StompModule: ForgeVFX failed to load:", result)
+		end
+	end
+end
+
+--// fires a VFX through ForgeVFX, or just bursts its emitters if ForgeVFX isn't there
+local function forgeEmit(object)
+	if ForgeVFX and ForgeVFX.emit then
+		task.spawn(function()
+			local ok, err = pcall(ForgeVFX.emit, object)
+			if not ok then
+				warn("StompModule: ForgeVFX.emit failed:", err)
+			end
+		end)
+		return
+	end
+	for _, v in ipairs(object:GetDescendants()) do
+		if v:IsA("ParticleEmitter") then
+			local Count = v:GetAttribute("EmitCount") or 20
+			task.delay(v:GetAttribute("EmitDelay") or 0, function()
+				if v.Parent then
+					v:Emit(Count)
+				end
+			end)
+		end
+	end
 end
 
 --// what each post effect looks like when it's doing nothing (so time stop ones can fade in from it)
@@ -805,8 +861,8 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 				task.delay(math.max(Sound.TimeLength, 1) + 0.5, Sound.Destroy, Sound)
 			end
 		end
-		flash(0.25 * power * Intensity * Feel, 0.15)
-		shake(1.5 * power, 14, 0, 0.25)
+		flash(0.18 * power * Intensity * Feel, 0.15)
+		shake(1.5 * power * StartShake, 14, 0, 0.3)
 	end
 
 	--// lightning stops cracking: emitters/beams off, lights die, gone once its particles are done
@@ -1040,9 +1096,9 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		end
 		spawnIntroModel()
 		spawnLightning()
-		flash(0.6 * Intensity * Feel, 0.35)
+		flash(0.45 * Intensity * Feel, 0.5)
 		strike(1)
-		shake(3, 12, 0.02, 0.5) --// the jolt of time stopping
+		shake(3 * StartShake, 12, 0.02, 0.7) --// the jolt of time stopping
 
 		--// lightning keeps cracking while he flies in
 		task.spawn(function()
@@ -1064,13 +1120,13 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		local StartTrails = spawnOrbitGroup("StartTrail", StartTrailCount, StartTrailRadius, StartTrailRadius * 2, WindTime, math.min(WindTime, 0.8))
 
 		Rest.Fov = -WindFov
-		Rest.Vignette = 0.45
-		Rest.Grade = { Brightness = -0.03, Contrast = 0.12, Saturation = -0.2 }
+		Rest.Vignette = StartVignette
+		Rest.Grade = StartLook
 		fov(Rest.Fov, WindTime, Sine, In)
-		vignette(Rest.Vignette, WindTime, Sine, In)
-		grade(Rest.Grade, WindTime, Sine, In)
+		vignette(Rest.Vignette, math.min(WindTime, 1.2), Sine, Out) --// vignette settles in early and stays
+		grade(Rest.Grade, math.min(WindTime, 1), Sine, Out)
 		bloom(0.9, 40, WindTime, Sine, In)
-		shake(1.2, 4, WindTime * 0.8, 0.4) --// low rumble that builds into the landing
+		shake(1.2 * StartShake, 4, WindTime * 0.8, 0.6) --// low rumble that builds into the landing
 
 		--// Don't transition until Fly In has completely ended.
 		waitForTrack(FlyInTrack, 15)
@@ -1086,10 +1142,12 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		flash(Intensity * Feel)
 		solidRig()
 
-		--// time starts again: last crack of lightning, the look eases out, the intro Model stops emitting
+		--// last big crack; the time stop look and lightning hang on a moment, then ease out. Intro Model stops now.
 		strike(1)
-		task.delay(0.15, endLightning, 0.4)
-		undoTimeStop(0.5)
+		later(StartLinger, function()
+			endLightning(StartFadeOut)
+			undoTimeStop(StartFadeOut)
+		end)
 		endIntroModel()
 		Rest.Blur = 0 --// the landing beat's blur fades all the way out
 		releaseOrbitGroup(StartTrails, 0.25)
@@ -1149,6 +1207,17 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 		if Feel > 0 then
 			hideMap()
+
+			--// ScreenEffect, same as Grand Sand Mausoleum: clone it into workspace and fire it through ForgeVFX
+			local ScreenEffectTemplate = Folder:FindFirstChild("ScreenEffect")
+			if ScreenEffectTemplate then
+				local ScreenEffect = ScreenEffectTemplate:Clone()
+				ScreenEffect.Parent = workspace
+				task.delay(ScreenEffectLife, ScreenEffect.Destroy, ScreenEffect)
+				forgeEmit(ScreenEffect)
+			else
+				warn("StompModule: no 'ScreenEffect' found in the folder, skipping it")
+			end
 		end
 		flash(1.2 * Intensity * Feel, 0.5)
 
