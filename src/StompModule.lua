@@ -79,7 +79,7 @@ local StartVignette = 0.4; --// vignette during Fly In (0 = black, 1 = none)
 local StartLinger = 1.2; --// seconds the time stop look + lightning hang on after the flash
 local StartFadeOut = 1; --// then how long they take to ease out
 
---// "ScreenEffect" in the folder fires on the reveal through the ForgeVFX module under this script
+--// "ScreenEffect" in the folder fires at the very start through ForgeVFX
 local ScreenEffectLife = 30
 
 --// "Model" in the folder: there through Fly In, stops emitting when Main starts, gone this many seconds after
@@ -228,12 +228,16 @@ local function nearness(position)
 	return 1 - (Distance - NearDistance) / (FarDistance - NearDistance)
 end
 
---// the ForgeVFX module sitting under this script (any name like ForgeVFX / forge-vfx / Forge VFX)
+--// ForgeVFX: the forge-vfx module under this script, or ReplicatedStorage.forge-vfx (any name like ForgeVFX / Forge VFX)
 local ForgeVFX = nil
 do
-	local Module = script:FindFirstChild("ForgeVFX")
-	if not Module then
-		for _, child in ipairs(script:GetChildren()) do
+	local Module = script:FindFirstChild("forge-vfx") or script:FindFirstChild("ForgeVFX")
+	local Places = { script, game:GetService("ReplicatedStorage") }
+	for _, Place in ipairs(Places) do
+		if Module then
+			break
+		end
+		for _, child in ipairs(Place:GetChildren()) do
 			local Squashed = (string.gsub(string.lower(child.Name), "[^%w]", ""))
 			if child:IsA("ModuleScript") and string.find(Squashed, "forgevfx", 1, true) then
 				Module = child
@@ -245,9 +249,18 @@ do
 		local ok, result = pcall(require, Module)
 		if ok then
 			ForgeVFX = result
+			--// it has to be initialised once before emit works
+			if type(ForgeVFX.init) == "function" then
+				local initOk, initErr = pcall(ForgeVFX.init)
+				if not initOk then
+					warn("StompModule: ForgeVFX.init failed:", initErr)
+				end
+			end
 		else
 			warn("StompModule: ForgeVFX failed to load:", result)
 		end
+	else
+		warn("StompModule: couldn't find the forge-vfx module, ScreenEffect will just burst its particles")
 	end
 end
 
@@ -1096,6 +1109,17 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 		end
 		spawnIntroModel()
 		spawnLightning()
+
+		--// ScreenEffect, same as Grand Sand Mausoleum: clone it into workspace and fire it through ForgeVFX
+		local ScreenEffectTemplate = Folder:FindFirstChild("ScreenEffect")
+		if ScreenEffectTemplate and Feel > 0 then
+			local ScreenEffect = ScreenEffectTemplate:Clone()
+			ScreenEffect.Parent = workspace
+			task.delay(ScreenEffectLife, ScreenEffect.Destroy, ScreenEffect)
+			forgeEmit(ScreenEffect)
+		elseif not ScreenEffectTemplate then
+			warn("StompModule: no 'ScreenEffect' found in the folder, skipping it")
+		end
 		flash(0.45 * Intensity * Feel, 0.5)
 		strike(1)
 		shake(3 * StartShake, 12, 0.02, 0.7) --// the jolt of time stopping
@@ -1207,17 +1231,6 @@ function EffectsModule.StartVFX(Target, mouseHit) --// Target is the HumanoidRoo
 
 		if Feel > 0 then
 			hideMap()
-
-			--// ScreenEffect, same as Grand Sand Mausoleum: clone it into workspace and fire it through ForgeVFX
-			local ScreenEffectTemplate = Folder:FindFirstChild("ScreenEffect")
-			if ScreenEffectTemplate then
-				local ScreenEffect = ScreenEffectTemplate:Clone()
-				ScreenEffect.Parent = workspace
-				task.delay(ScreenEffectLife, ScreenEffect.Destroy, ScreenEffect)
-				forgeEmit(ScreenEffect)
-			else
-				warn("StompModule: no 'ScreenEffect' found in the folder, skipping it")
-			end
 		end
 		flash(1.2 * Intensity * Feel, 0.5)
 
